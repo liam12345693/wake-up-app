@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+config.json
+chat-history.json
+*.sqlite3
+*.sqlite3-*

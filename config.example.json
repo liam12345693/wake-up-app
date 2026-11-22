@@ -1,0 +1,7 @@
+{
+  "api_base": "https://你的中转站地址/v1",
+  "api_key": "sk-在这里填你的key",
+  "main_model": "在这里填主模型id",
+  "slm_model": "",
+  "port": 8000
+}
