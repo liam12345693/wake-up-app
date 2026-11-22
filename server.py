@@ -15,6 +15,7 @@ run_coroutine_threadsafe 回到同一个 asyncio 主事件循环执行，
 
 启动：python server.py
 浏览器：http://127.0.0.1:8000
+诊断：浏览器打开 http://127.0.0.1:8000/api/diag
 """
 
 import asyncio
@@ -22,6 +23,7 @@ import json
 import os
 import re
 import threading
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -71,25 +73,95 @@ outbox = asyncio.Queue()
 history = []
 history_lock = threading.Lock()
 
+LAST_ERROR = {"where": "", "message": ""}
+
+
+# ---------------- 报错处理：把上游真实原因带出来 ----------------
+
+class ApiError(RuntimeError):
+    def __init__(self, status, body, url=""):
+        self.status = status
+        self.body = body or ""
+        self.url = url
+        super().__init__("HTTP %s: %s" % (status, brief_error(self.body)))
+
+    def brief(self):
+        return "HTTP %s %s" % (self.status, brief_error(self.body))
+
+
+def brief_error(body):
+    """从各种上游错误格式里提取一句人话。"""
+    text = str(body or "").strip()
+    if not text:
+        return "(空响应)"
+    try:
+        data = json.loads(text)
+    except Exception:
+        return text[:400]
+    cands = []
+    if isinstance(data, dict):
+        err = data.get("error")
+        if isinstance(err, dict):
+            cands.append(err.get("message"))
+            for v in err.values():
+                if isinstance(v, str):
+                    cands.append(v)
+        elif isinstance(err, list) and err:
+            first = err[0]
+            if isinstance(first, dict):
+                cands.append(first.get("message"))
+        elif isinstance(err, str):
+            cands.append(err)
+        cands.append(data.get("message"))
+        cands.append(data.get("detail"))
+        for det in (data.get("details") or []) if isinstance(data.get("details"), list) else []:
+            if isinstance(det, dict):
+                cands.append(det.get("message"))
+    for c in cands:
+        if isinstance(c, str) and c.strip():
+            return c.strip()[:400]
+    return text[:400]
+
+
+def _request(path, payload=None, timeout=180, method=None):
+    url = API_BASE + path
+    data = None
+    headers = {"Accept": "application/json"}
+    if API_KEY:
+        headers["Authorization"] = "Bearer " + API_KEY
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers,
+                                 method=method or ("POST" if data is not None else "GET"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            try:
+                return resp.status, json.loads(raw)
+            except Exception:
+                return resp.status, {"raw": raw}
+    except urllib.error.HTTPError as exc:
+        raise ApiError(exc.code, exc.read().decode("utf-8", "replace"), url)
+    except urllib.error.URLError as exc:
+        raise ApiError(0, "连不上 %s：%s" % (API_BASE, exc.reason), url)
+    except Exception as exc:
+        raise ApiError(0, str(exc), url)
+
+
+def _post(path, payload, timeout=180):
+    return _request(path, payload, timeout)
+
+
+def _get(path, timeout=60):
+    return _request(path, None, timeout)
+
 
 # ---------------- 模型调用（中转站，OpenAI 兼容） ----------------
 
-def _post(path, payload, timeout=180):
-    req = urllib.request.Request(
-        API_BASE + path,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Authorization": "Bearer " + API_KEY,
-            "Content-Type": "application/json",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
 async def chat_api(model, messages, tools=None, temperature=0.5, max_tokens=1500):
     if not model:
-        raise RuntimeError("没有配置模型 id，请编辑 config.json")
+        raise ApiError(0, "没有配置模型 id，请编辑 config.json")
     payload = {
         "model": model,
         "messages": messages,
@@ -99,8 +171,11 @@ async def chat_api(model, messages, tools=None, temperature=0.5, max_tokens=1500
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
-    data = await asyncio.to_thread(_post, "/chat/completions", payload)
-    return data["choices"][0]["message"]
+    st, data = await asyncio.to_thread(_post, "/chat/completions", payload)
+    try:
+        return data["choices"][0]["message"]
+    except Exception:
+        raise ApiError(st, json.dumps(data, ensure_ascii=False), API_BASE + "/chat/completions")
 
 
 def extract_json(text):
@@ -142,6 +217,8 @@ async def host_slm(*, system, user_content, max_tokens, temperature) -> dict:
         data = extract_json(msg.get("content") or "")
         return data if isinstance(data, dict) and data else _slm_fallback(system)
     except Exception as exc:
+        LAST_ERROR["where"] = "slm"
+        LAST_ERROR["message"] = str(exc)
         print("[slm] failed:", exc)
         return _slm_fallback(system)
 
@@ -170,10 +247,11 @@ async def run_model_turn(messages, tool_schemas, dispatch, max_rounds=6):
         try:
             msg = await chat_api(MAIN_MODEL, messages,
                                  tools=tool_schemas if use_tools else None)
-        except Exception as exc:
-            if use_tools:
+        except ApiError as exc:
+            if use_tools and exc.status in (400, 404, 422):
+                # 有些中转站不支持 tools 参数，去掉再试一次。
                 use_tools = False
-                print("[tools] 不可用，退回纯文本:", exc)
+                print("[tools] 不被支持，退回纯文本:", exc)
                 messages.append({"role": "system",
                                  "content": "（本轮没有工具可用，请直接用文字说明你建议的安排。）"})
                 continue
@@ -241,6 +319,8 @@ async def host_runner(request, on_accepted, tools, interrupted):
     try:
         text = await run_model_turn(msgs, openai_tools(engine), dispatch)
     except Exception as exc:
+        LAST_ERROR["where"] = "wake"
+        LAST_ERROR["message"] = str(exc)
         return {"accepted": True, "completed": False, "error": str(exc)}
 
     if text:
@@ -301,8 +381,14 @@ async def handle_user_message(text):
 
     try:
         reply = await run_model_turn(msgs, openai_tools(engine), dispatch)
+        LAST_ERROR["where"] = ""
+        LAST_ERROR["message"] = ""
     except Exception as exc:
-        reply = "（模型调用失败：" + str(exc) + "）"
+        LAST_ERROR["where"] = "chat"
+        LAST_ERROR["message"] = str(exc)
+        reply = ("（模型调用失败）\n" + str(exc)
+                 + "\n\n提示：打开 http://127.0.0.1:8000/api/diag 可以看到中转站返回的真实原因，"
+                   "以及它支持哪些模型名。")
 
     with history_lock:
         history.append({"role": "assistant", "content": reply})
@@ -331,6 +417,72 @@ def save_history():
             json.dumps(history[-200:], ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as exc:
         print("[history] save failed:", exc)
+
+
+# ---------------- 诊断：一眼看出 key / 地址 / 模型哪个不对 ----------------
+
+def diagnose():
+    """检查配置、列出中转站支持的模型、并实测当前模型能否调用。"""
+    out = {
+        "api_base": API_BASE,
+        "main_model": MAIN_MODEL,
+        "slm_model": SLM_MODEL,
+        "key_present": bool(API_KEY),
+        "key_preview": (API_KEY[:6] + "..." + API_KEY[-4:]) if API_KEY else "",
+        "models": [],
+        "models_error": "",
+        "chat_ok": None,
+        "chat_error": "",
+        "suggestion": "",
+    }
+
+    if not API_BASE:
+        out["suggestion"] = "config.json 里没有 api_base。"
+        return out
+    if not API_KEY:
+        out["suggestion"] = "config.json 里没有 api_key。"
+        return out
+
+    # 1) 中转站支持哪些模型
+    try:
+        st, data = await0(_get, "/models")
+        ids = [m.get("id") for m in (data.get("data") or []) if isinstance(m, dict)]
+        out["models"] = ids[:300]
+        out["models_count"] = len(ids)
+    except Exception as exc:
+        out["models_error"] = str(exc)
+
+    # 2) 当前模型能不能真的调通
+    if MAIN_MODEL:
+        try:
+            await0(_post, "/chat/completions", {
+                "model": MAIN_MODEL,
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 16,
+            })
+            out["chat_ok"] = True
+        except Exception as exc:
+            out["chat_ok"] = False
+            out["chat_error"] = str(exc)
+
+    # 3) 给结论
+    if out["chat_ok"] is True:
+        out["suggestion"] = "一切正常，可以直接聊天。"
+    elif out["models"]:
+        hit = [m for m in out["models"] if MAIN_MODEL and MAIN_MODEL.lower() in str(m).lower()]
+        if hit:
+            out["suggestion"] = "模型名接近可用值，试试：" + ", ".join(hit[:5])
+        else:
+            out["suggestion"] = ("当前模型 %s 不在中转站清单里。"
+                                 "请把 main_model 改成下面清单里的一个名字。" % MAIN_MODEL)
+    elif out["chat_error"]:
+        out["suggestion"] = "看 chat_error 里的真实原因。"
+    return out
+
+
+def await0(fn, *args):
+    """同步小助手：把 (fn, *args) 直接执行。"""
+    return fn(*args)
 
 
 # ---------------- HTTP 层 ----------------
@@ -376,10 +528,16 @@ class Handler(BaseHTTPRequestHandler):
                         "active_scenes": st.get("active_scenes", []),
                         "recent_scenes": st.get("recent_scenes", [])[-8:],
                         "settings": settings,
+                        "last_error": LAST_ERROR,
                     }
                 except Exception as exc:
                     return {"ok": False, "error": str(exc)}
             self._send(200, asyncio.run_coroutine_threadsafe(status(), MAIN_LOOP).result(timeout=20))
+        elif path == "/api/diag":
+            def run_diag():
+                return diagnose()
+            self._send(200, asyncio.run_coroutine_threadsafe(
+                asyncio.to_thread(run_diag), MAIN_LOOP).result(timeout=90))
         else:
             self._send(404, {"error": "not found"})
 
@@ -448,6 +606,7 @@ async def main():
     print("   本机     : http://127.0.0.1:%d" % PORT)
     print("   局域网   : http://192.168.31.127:%d" % PORT)
     print("   模型     : %s  @  %s" % (MAIN_MODEL, API_BASE))
+    print("   诊断     : http://127.0.0.1:%d/api/diag" % PORT)
     if not (API_BASE and API_KEY and MAIN_MODEL):
         print("   [警告] 配置不完整，请编辑 config.json 后重启")
     print("=" * 60)
